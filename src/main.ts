@@ -16,10 +16,10 @@ export async function run(): Promise<void> {
 
     const dokploy = new Dokploy(url, token)
 
-    const projectID: string = core.getInput('project-id')
-    const composeID: string = core.getInput('compose-id')
+    const projectId: string = core.getInput('project-id')
+    const composeId: string = core.getInput('compose-id')
 
-    core.info(`Deploying compose ${composeID} in project ${projectID}`)
+    core.info(`Deploying compose ${composeId} in project ${projectId}`)
 
     let projects: Project[]
     try {
@@ -28,18 +28,18 @@ export async function run(): Promise<void> {
       throw new Error(`Failed to get projects: ${error as Error}`)
     }
 
-    const project = projects.find(p => p.projectId === projectID)
+    const project = projects.find(p => p.projectId === projectId)
     if (!project) {
-      throw new Error(`Project ${projectID} not found`)
+      throw new Error(`Project ${projectId} not found`)
     }
 
-    const compose = project.compose.find(c => c.composeId === composeID)
+    const compose = project.compose.find(c => c.composeId === composeId)
     if (!compose) {
-      throw new Error(`Compose ${composeID} not found`)
+      throw new Error(`Compose ${composeId} not found`)
     }
 
     try {
-      await dokploy.redeployCompose(composeID)
+      await dokploy.redeployCompose(compose.composeId)
     } catch (error) {
       throw new Error(`Failed to redeploy compose: ${error as Error}`)
     }

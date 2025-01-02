@@ -1,7 +1,7 @@
 {
   "name": "dokploy-deploy-compose",
   "description": "GitHub Actions to redeploy a compose in Dokploy",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "author": "",
   "private": true,
   "homepage": "https://github.com/dokploy/dokploy-deploy-compose",
@@ -67,7 +67,8 @@
     ]
   },
   "dependencies": {
-    "@actions/core": "^1.11.1"
+    "@actions/core": "^1.11.1",
+    "undici": "^7.2.0"
   },
   "devDependencies": {
     "@github/local-action": "^2.2.1",
