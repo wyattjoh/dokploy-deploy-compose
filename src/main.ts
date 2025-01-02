@@ -25,9 +25,7 @@ export async function run(): Promise<void> {
     try {
       projects = await dokploy.getProjects()
     } catch (error) {
-      throw new Error('Failed to get projects', {
-        cause: error
-      })
+      throw new Error(`Failed to get projects: ${error as Error}`)
     }
 
     const project = projects.find(p => p.projectId === projectID)
@@ -43,9 +41,7 @@ export async function run(): Promise<void> {
     try {
       await dokploy.redeployCompose(composeID)
     } catch (error) {
-      throw new Error(`Failed to redeploy compose`, {
-        cause: error
-      })
+      throw new Error(`Failed to redeploy compose: ${error as Error}`)
     }
   } catch (error) {
     // Fail the workflow run if an error occurs

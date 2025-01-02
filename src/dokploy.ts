@@ -24,7 +24,7 @@ export class Dokploy {
       }
     })
     if (!response.ok) {
-      throw new Error(`Failed to fetch projects: ${response.statusText}`)
+      throw new Error(`Failed to fetch projects: ${await response.text()}`)
     }
 
     const data = (await response.json()) as Project[]
@@ -44,7 +44,7 @@ export class Dokploy {
       })
     })
     if (!response.ok) {
-      throw new Error(`Failed to redeploy compose: ${response.statusText}`)
+      throw new Error(`Failed to redeploy compose: ${await response.text()}`)
     }
   }
 }

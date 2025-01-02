@@ -25648,7 +25648,7 @@ class Dokploy {
             }
         });
         if (!response.ok) {
-            throw new Error(`Failed to fetch projects: ${response.statusText}`);
+            throw new Error(`Failed to fetch projects: ${await response.text()}`);
         }
         const data = (await response.json());
         return data;
@@ -25665,7 +25665,7 @@ class Dokploy {
             })
         });
         if (!response.ok) {
-            throw new Error(`Failed to redeploy compose: ${response.statusText}`);
+            throw new Error(`Failed to redeploy compose: ${await response.text()}`);
         }
     }
 }
@@ -25736,9 +25736,7 @@ async function run() {
             projects = await dokploy.getProjects();
         }
         catch (error) {
-            throw new Error('Failed to get projects', {
-                cause: error
-            });
+            throw new Error(`Failed to get projects: ${error}`);
         }
         const project = projects.find(p => p.projectId === projectID);
         if (!project) {
@@ -25752,9 +25750,7 @@ async function run() {
             await dokploy.redeployCompose(composeID);
         }
         catch (error) {
-            throw new Error(`Failed to redeploy compose`, {
-                cause: error
-            });
+            throw new Error(`Failed to redeploy compose: ${error}`);
         }
     }
     catch (error) {
