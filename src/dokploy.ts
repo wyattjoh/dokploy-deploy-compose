@@ -37,7 +37,8 @@ export class Dokploy {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${this.token}`,
-        Accept: 'application/json'
+        Accept: 'application/json',
+        'Content-Type': 'application/json'
       },
       body: JSON.stringify({
         composeId

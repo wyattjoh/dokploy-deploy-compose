@@ -1,16 +1,16 @@
 {
-  "name": "typescript-action",
-  "description": "GitHub Actions TypeScript template",
-  "version": "1.0.1",
+  "name": "dokploy-deploy-compose",
+  "description": "GitHub Actions to redeploy a compose in Dokploy",
+  "version": "1.0.2",
   "author": "",
   "private": true,
-  "homepage": "https://github.com/actions/typescript-action",
+  "homepage": "https://github.com/dokploy/dokploy-deploy-compose",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/actions/typescript-action.git"
+    "url": "git+https://github.com/dokploy/dokploy-deploy-compose.git"
   },
   "bugs": {
-    "url": "https://github.com/actions/typescript-action/issues"
+    "url": "https://github.com/dokploy/dokploy-deploy-compose/issues"
   },
   "keywords": [
     "actions",
