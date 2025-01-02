@@ -1,24 +1,52 @@
 import * as core from '@actions/core'
-import { wait } from './wait'
+import { Dokploy, type Project } from './dokploy'
 
-/**
- * The main function for the action.
- * @returns {Promise<void>} Resolves when the action is complete.
- */
 export async function run(): Promise<void> {
   try {
-    const ms: string = core.getInput('milliseconds')
+    const url: string = core.getInput('url')
 
-    // Debug logs are only output if the `ACTIONS_STEP_DEBUG` secret is true
-    core.debug(`Waiting ${ms} milliseconds ...`)
+    // Validate that the url is a valid URL
+    try {
+      new URL(url)
+    } catch {
+      throw new Error(`Invalid URL: ${url}`)
+    }
 
-    // Log the current timestamp, wait, then log the new timestamp
-    core.debug(new Date().toTimeString())
-    await wait(parseInt(ms, 10))
-    core.debug(new Date().toTimeString())
+    const token: string = core.getInput('token')
 
-    // Set outputs for other workflow steps to use
-    core.setOutput('time', new Date().toTimeString())
+    const dokploy = new Dokploy(url, token)
+
+    const projectID: string = core.getInput('project-id')
+    const composeID: string = core.getInput('compose-id')
+
+    core.info(`Deploying compose ${composeID} in project ${projectID}`)
+
+    let projects: Project[]
+    try {
+      projects = await dokploy.getProjects()
+    } catch (error) {
+      throw new Error('Failed to get projects', {
+        cause: error
+      })
+    }
+
+    const project = projects.find(p => p.projectId === projectID)
+    if (!project) {
+      throw new Error(`Project ${projectID} not found`)
+    }
+
+    const compose = project.compose.find(c => c.composeId === composeID)
+    if (!compose) {
+      throw new Error(`Compose ${composeID} not found`)
+    }
+
+    try {
+      await dokploy.redeployCompose(composeID)
+    } catch (error) {
+      throw new Error(`Failed to redeploy compose`, {
+        cause: error
+      })
+    }
   } catch (error) {
     // Fail the workflow run if an error occurs
     if (error instanceof Error) core.setFailed(error.message)
