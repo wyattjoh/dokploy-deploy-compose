@@ -25626,6 +25626,54 @@ module.exports = {
 
 /***/ }),
 
+/***/ 3325:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.Dokploy = void 0;
+class Dokploy {
+    url;
+    token;
+    constructor(url, token) {
+        this.url = url;
+        this.token = token;
+    }
+    async getProjects() {
+        const response = await fetch(`${this.url}/api/project.all`, {
+            headers: {
+                Authorization: `Bearer ${this.token}`,
+                Accept: 'application/json'
+            }
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to fetch projects: ${response.statusText}`);
+        }
+        const data = (await response.json());
+        return data;
+    }
+    async redeployCompose(composeId) {
+        const response = await fetch(`${this.url}/api/compose.redeploy`, {
+            method: 'POST',
+            headers: {
+                Authorization: `Bearer ${this.token}`,
+                Accept: 'application/json'
+            },
+            body: JSON.stringify({
+                composeId
+            })
+        });
+        if (!response.ok) {
+            throw new Error(`Failed to redeploy compose: ${response.statusText}`);
+        }
+    }
+}
+exports.Dokploy = Dokploy;
+
+
+/***/ }),
+
 /***/ 1730:
 /***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
 
@@ -25667,52 +25715,53 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.run = run;
 const core = __importStar(__nccwpck_require__(7484));
-const wait_1 = __nccwpck_require__(910);
-/**
- * The main function for the action.
- * @returns {Promise<void>} Resolves when the action is complete.
- */
+const dokploy_1 = __nccwpck_require__(3325);
 async function run() {
     try {
-        const ms = core.getInput('milliseconds');
-        // Debug logs are only output if the `ACTIONS_STEP_DEBUG` secret is true
-        core.debug(`Waiting ${ms} milliseconds ...`);
-        // Log the current timestamp, wait, then log the new timestamp
-        core.debug(new Date().toTimeString());
-        await (0, wait_1.wait)(parseInt(ms, 10));
-        core.debug(new Date().toTimeString());
-        // Set outputs for other workflow steps to use
-        core.setOutput('time', new Date().toTimeString());
+        const url = core.getInput('url');
+        // Validate that the url is a valid URL
+        try {
+            new URL(url);
+        }
+        catch {
+            throw new Error(`Invalid URL: ${url}`);
+        }
+        const token = core.getInput('token');
+        const dokploy = new dokploy_1.Dokploy(url, token);
+        const projectID = core.getInput('project-id');
+        const composeID = core.getInput('compose-id');
+        core.info(`Deploying compose ${composeID} in project ${projectID}`);
+        let projects;
+        try {
+            projects = await dokploy.getProjects();
+        }
+        catch (error) {
+            throw new Error('Failed to get projects', {
+                cause: error
+            });
+        }
+        const project = projects.find(p => p.projectId === projectID);
+        if (!project) {
+            throw new Error(`Project ${projectID} not found`);
+        }
+        const compose = project.compose.find(c => c.composeId === composeID);
+        if (!compose) {
+            throw new Error(`Compose ${composeID} not found`);
+        }
+        try {
+            await dokploy.redeployCompose(composeID);
+        }
+        catch (error) {
+            throw new Error(`Failed to redeploy compose`, {
+                cause: error
+            });
+        }
     }
     catch (error) {
         // Fail the workflow run if an error occurs
         if (error instanceof Error)
             core.setFailed(error.message);
     }
-}
-
-
-/***/ }),
-
-/***/ 910:
-/***/ ((__unused_webpack_module, exports) => {
-
-"use strict";
-
-Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.wait = wait;
-/**
- * Wait for a number of milliseconds.
- * @param milliseconds The number of milliseconds to wait.
- * @returns {Promise<string>} Resolves with 'done!' after the wait is over.
- */
-async function wait(milliseconds) {
-    return new Promise(resolve => {
-        if (isNaN(milliseconds)) {
-            throw new Error('milliseconds not a number');
-        }
-        setTimeout(() => resolve('done!'), milliseconds);
-    });
 }
 
 
