@@ -68,7 +68,7 @@
   },
   "dependencies": {
     "@actions/core": "^1.11.1",
-    "undici": "^7.2.0"
+    "undici": "^7.2.1"
   },
   "devDependencies": {
     "@github/local-action": "^2.2.1",
