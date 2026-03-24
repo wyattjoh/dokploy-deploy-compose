@@ -25640,12 +25640,14 @@ const Agent = __nccwpck_require__(7405)
 const ProxyAgent = __nccwpck_require__(6672)
 const EnvHttpProxyAgent = __nccwpck_require__(3137)
 const RetryAgent = __nccwpck_require__(50)
+const H2CClient = __nccwpck_require__(6815)
 const errors = __nccwpck_require__(8707)
 const util = __nccwpck_require__(3440)
 const { InvalidArgumentError } = errors
 const api = __nccwpck_require__(6615)
 const buildConnector = __nccwpck_require__(9136)
 const MockClient = __nccwpck_require__(7365)
+const { MockCallHistory, MockCallHistoryLog } = __nccwpck_require__(431)
 const MockAgent = __nccwpck_require__(7501)
 const MockPool = __nccwpck_require__(4004)
 const mockErrors = __nccwpck_require__(2429)
@@ -25664,6 +25666,7 @@ module.exports.Agent = Agent
 module.exports.ProxyAgent = ProxyAgent
 module.exports.EnvHttpProxyAgent = EnvHttpProxyAgent
 module.exports.RetryAgent = RetryAgent
+module.exports.H2CClient = H2CClient
 module.exports.RetryHandler = RetryHandler
 
 module.exports.DecoratorHandler = DecoratorHandler
@@ -25801,6 +25804,8 @@ module.exports.connect = makeDispatcher(api.connect)
 module.exports.upgrade = makeDispatcher(api.upgrade)
 
 module.exports.MockClient = MockClient
+module.exports.MockCallHistory = MockCallHistory
+module.exports.MockCallHistoryLog = MockCallHistoryLog
 module.exports.MockPool = MockPool
 module.exports.MockAgent = MockAgent
 module.exports.mockErrors = mockErrors
@@ -27465,7 +27470,13 @@ class MemoryCacheStore {
     const entry = this.#entries.get(topLevelKey)?.find((entry) => (
       entry.deleteAt > now &&
       entry.method === key.method &&
-      (entry.vary == null || Object.keys(entry.vary).every(headerName => entry.vary[headerName] === key.headers?.[headerName]))
+      (entry.vary == null || Object.keys(entry.vary).every(headerName => {
+        if (entry.vary[headerName] === null) {
+          return key.headers[headerName] === undefined
+        }
+
+        return entry.vary[headerName] === key.headers[headerName]
+      }))
     ))
 
     return entry == null
@@ -27586,11 +27597,18 @@ const MAX_ENTRY_SIZE = 2 * 1000 * 1000 * 1000
  * @implements {CacheStore}
  *
  * @typedef {{
- *  id: Readonly<number>
- *  headers?: Record<string, string | string[]>
- *  vary?: string | object
- *  body: string
- * } & import('../../types/cache-interceptor.d.ts').default.CacheValue} SqliteStoreValue
+ *  id: Readonly<number>,
+ *  body?: Uint8Array
+ *  statusCode: number
+ *  statusMessage: string
+ *  headers?: string
+ *  vary?: string
+ *  etag?: string
+ *  cacheControlDirectives?: string
+ *  cachedAt: number
+ *  staleAt: number
+ *  deleteAt: number
+ * }} SqliteStoreValue
  */
 module.exports = class SqliteCacheStore {
   #maxEntrySize = MAX_ENTRY_SIZE
@@ -27632,7 +27650,7 @@ module.exports = class SqliteCacheStore {
   #countEntriesQuery
 
   /**
-   * @type {import('node:sqlite').StatementSync}
+   * @type {import('node:sqlite').StatementSync | null}
    */
   #deleteOldValuesQuery
 
@@ -27734,8 +27752,7 @@ module.exports = class SqliteCacheStore {
         etag = ?,
         cacheControlDirectives = ?,
         cachedAt = ?,
-        staleAt = ?,
-        deleteAt = ?
+        staleAt = ?
       WHERE
         id = ?
     `)
@@ -27753,9 +27770,8 @@ module.exports = class SqliteCacheStore {
         cacheControlDirectives,
         vary,
         cachedAt,
-        staleAt,
-        deleteAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        staleAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `)
 
     this.#deleteByUrlQuery = this.#db.prepare(
@@ -27790,36 +27806,78 @@ module.exports = class SqliteCacheStore {
 
   /**
    * @param {import('../../types/cache-interceptor.d.ts').default.CacheKey} key
-   * @returns {import('../../types/cache-interceptor.d.ts').default.GetResult | undefined}
+   * @returns {(import('../../types/cache-interceptor.d.ts').default.GetResult & { body?: Buffer }) | undefined}
    */
   get (key) {
     assertCacheKey(key)
 
     const value = this.#findValue(key)
+    return value
+      ? {
+          body: value.body ? Buffer.from(value.body.buffer, value.body.byteOffset, value.body.byteLength) : undefined,
+          statusCode: value.statusCode,
+          statusMessage: value.statusMessage,
+          headers: value.headers ? JSON.parse(value.headers) : undefined,
+          etag: value.etag ? value.etag : undefined,
+          vary: value.vary ? JSON.parse(value.vary) : undefined,
+          cacheControlDirectives: value.cacheControlDirectives
+            ? JSON.parse(value.cacheControlDirectives)
+            : undefined,
+          cachedAt: value.cachedAt,
+          staleAt: value.staleAt,
+          deleteAt: value.deleteAt
+        }
+      : undefined
+  }
 
-    if (!value) {
-      return undefined
+  /**
+   * @param {import('../../types/cache-interceptor.d.ts').default.CacheKey} key
+   * @param {import('../../types/cache-interceptor.d.ts').default.CacheValue & { body: null | Buffer | Array<Buffer>}} value
+   */
+  set (key, value) {
+    assertCacheKey(key)
+
+    const url = this.#makeValueUrl(key)
+    const body = Array.isArray(value.body) ? Buffer.concat(value.body) : value.body
+    const size = body?.byteLength
+
+    if (size && size > this.#maxEntrySize) {
+      return
     }
 
-    /**
-     * @type {import('../../types/cache-interceptor.d.ts').default.GetResult}
-     */
-    const result = {
-      body: Buffer.from(value.body),
-      statusCode: value.statusCode,
-      statusMessage: value.statusMessage,
-      headers: value.headers ? JSON.parse(value.headers) : undefined,
-      etag: value.etag ? value.etag : undefined,
-      vary: value.vary ?? undefined,
-      cacheControlDirectives: value.cacheControlDirectives
-        ? JSON.parse(value.cacheControlDirectives)
-        : undefined,
-      cachedAt: value.cachedAt,
-      staleAt: value.staleAt,
-      deleteAt: value.deleteAt
+    const existingValue = this.#findValue(key, true)
+    if (existingValue) {
+      // Updating an existing response, let's overwrite it
+      this.#updateValueQuery.run(
+        body,
+        value.deleteAt,
+        value.statusCode,
+        value.statusMessage,
+        value.headers ? JSON.stringify(value.headers) : null,
+        value.etag ? value.etag : null,
+        value.cacheControlDirectives ? JSON.stringify(value.cacheControlDirectives) : null,
+        value.cachedAt,
+        value.staleAt,
+        existingValue.id
+      )
+    } else {
+      this.#prune()
+      // New response, let's insert it
+      this.#insertValueQuery.run(
+        url,
+        key.method,
+        body,
+        value.deleteAt,
+        value.statusCode,
+        value.statusMessage,
+        value.headers ? JSON.stringify(value.headers) : null,
+        value.etag ? value.etag : null,
+        value.cacheControlDirectives ? JSON.stringify(value.cacheControlDirectives) : null,
+        value.vary ? JSON.stringify(value.vary) : null,
+        value.cachedAt,
+        value.staleAt
+      )
     }
-
-    return result
   }
 
   /**
@@ -27831,7 +27889,6 @@ module.exports = class SqliteCacheStore {
     assertCacheKey(key)
     assertCacheValue(value)
 
-    const url = this.#makeValueUrl(key)
     let size = 0
     /**
      * @type {Buffer[] | null}
@@ -27840,11 +27897,8 @@ module.exports = class SqliteCacheStore {
     const store = this
 
     return new Writable({
+      decodeStrings: true,
       write (chunk, encoding, callback) {
-        if (typeof chunk === 'string') {
-          chunk = Buffer.from(chunk, encoding)
-        }
-
         size += chunk.byteLength
 
         if (size < store.#maxEntrySize) {
@@ -27856,42 +27910,7 @@ module.exports = class SqliteCacheStore {
         callback()
       },
       final (callback) {
-        const existingValue = store.#findValue(key, true)
-        if (existingValue) {
-          // Updating an existing response, let's overwrite it
-          store.#updateValueQuery.run(
-            Buffer.concat(body),
-            value.deleteAt,
-            value.statusCode,
-            value.statusMessage,
-            value.headers ? JSON.stringify(value.headers) : null,
-            value.etag ? value.etag : null,
-            value.cacheControlDirectives ? JSON.stringify(value.cacheControlDirectives) : null,
-            value.cachedAt,
-            value.staleAt,
-            value.deleteAt,
-            existingValue.id
-          )
-        } else {
-          store.#prune()
-          // New response, let's insert it
-          store.#insertValueQuery.run(
-            url,
-            key.method,
-            Buffer.concat(body),
-            value.deleteAt,
-            value.statusCode,
-            value.statusMessage,
-            value.headers ? JSON.stringify(value.headers) : null,
-            value.etag ? value.etag : null,
-            value.cacheControlDirectives ? JSON.stringify(value.cacheControlDirectives) : null,
-            value.vary ? JSON.stringify(value.vary) : null,
-            value.cachedAt,
-            value.staleAt,
-            value.deleteAt
-          )
-        }
-
+        store.set(key, { ...value, body })
         callback()
       }
     })
@@ -27915,14 +27934,14 @@ module.exports = class SqliteCacheStore {
 
     {
       const removed = this.#deleteExpiredValuesQuery.run(Date.now()).changes
-      if (removed > 0) {
+      if (removed) {
         return removed
       }
     }
 
     {
-      const removed = this.#deleteOldValuesQuery.run(Math.max(Math.floor(this.#maxCount * 0.1), 1)).changes
-      if (removed > 0) {
+      const removed = this.#deleteOldValuesQuery?.run(Math.max(Math.floor(this.#maxCount * 0.1), 1)).changes
+      if (removed) {
         return removed
       }
     }
@@ -27950,7 +27969,7 @@ module.exports = class SqliteCacheStore {
   /**
    * @param {import('../../types/cache-interceptor.d.ts').default.CacheKey} key
    * @param {boolean} [canBeExpired=false]
-   * @returns {(SqliteStoreValue & { vary?: Record<string, string[]> }) | undefined}
+   * @returns {SqliteStoreValue | undefined}
    */
   #findValue (key, canBeExpired = false) {
     const url = this.#makeValueUrl(key)
@@ -27974,14 +27993,10 @@ module.exports = class SqliteCacheStore {
       let matches = true
 
       if (value.vary) {
-        if (!headers) {
-          return undefined
-        }
+        const vary = JSON.parse(value.vary)
 
-        value.vary = JSON.parse(value.vary)
-
-        for (const header in value.vary) {
-          if (!headerValueEquals(headers[header], value.vary[header])) {
+        for (const header in vary) {
+          if (!headerValueEquals(headers[header], vary[header])) {
             matches = false
             break
           }
@@ -28003,18 +28018,21 @@ module.exports = class SqliteCacheStore {
  * @returns {boolean}
  */
 function headerValueEquals (lhs, rhs) {
+  if (lhs == null && rhs == null) {
+    return true
+  }
+
+  if ((lhs == null && rhs != null) ||
+      (lhs != null && rhs == null)) {
+    return false
+  }
+
   if (Array.isArray(lhs) && Array.isArray(rhs)) {
     if (lhs.length !== rhs.length) {
       return false
     }
 
-    for (let i = 0; i < lhs.length; i++) {
-      if (rhs.includes(lhs[i])) {
-        return false
-      }
-    }
-
-    return true
+    return lhs.every((x, i) => x === rhs[i])
   }
 
   return lhs === rhs
@@ -28032,10 +28050,7 @@ function headerValueEquals (lhs, rhs) {
 const net = __nccwpck_require__(7030)
 const assert = __nccwpck_require__(4589)
 const util = __nccwpck_require__(3440)
-const { InvalidArgumentError, ConnectTimeoutError } = __nccwpck_require__(8707)
-const timers = __nccwpck_require__(6603)
-
-function noop () {}
+const { InvalidArgumentError } = __nccwpck_require__(8707)
 
 let tls // include tls conditionally since it is not always available
 
@@ -28135,7 +28150,6 @@ function buildConnector ({ allowH2, maxCachedSessions, socketPath, timeout, sess
         servername,
         session,
         localAddress,
-        // TODO(HTTP/2): Add support for h2c
         ALPNProtocols: allowH2 ? ['http/1.1', 'h2'] : ['http/1.1'],
         socket: httpSocket, // upgrade socket connection
         port,
@@ -28167,7 +28181,7 @@ function buildConnector ({ allowH2, maxCachedSessions, socketPath, timeout, sess
       socket.setKeepAlive(true, keepAliveInitialDelay)
     }
 
-    const clearConnectTimeout = setupConnectTimeout(new WeakRef(socket), { timeout, hostname, port })
+    const clearConnectTimeout = util.setupConnectTimeout(new WeakRef(socket), { timeout, hostname, port })
 
     socket
       .setNoDelay(true)
@@ -28192,78 +28206,6 @@ function buildConnector ({ allowH2, maxCachedSessions, socketPath, timeout, sess
 
     return socket
   }
-}
-
-/**
- * @param {WeakRef<net.Socket>} socketWeakRef
- * @param {object} opts
- * @param {number} opts.timeout
- * @param {string} opts.hostname
- * @param {number} opts.port
- * @returns {() => void}
- */
-const setupConnectTimeout = process.platform === 'win32'
-  ? (socketWeakRef, opts) => {
-      if (!opts.timeout) {
-        return noop
-      }
-
-      let s1 = null
-      let s2 = null
-      const fastTimer = timers.setFastTimeout(() => {
-      // setImmediate is added to make sure that we prioritize socket error events over timeouts
-        s1 = setImmediate(() => {
-        // Windows needs an extra setImmediate probably due to implementation differences in the socket logic
-          s2 = setImmediate(() => onConnectTimeout(socketWeakRef.deref(), opts))
-        })
-      }, opts.timeout)
-      return () => {
-        timers.clearFastTimeout(fastTimer)
-        clearImmediate(s1)
-        clearImmediate(s2)
-      }
-    }
-  : (socketWeakRef, opts) => {
-      if (!opts.timeout) {
-        return noop
-      }
-
-      let s1 = null
-      const fastTimer = timers.setFastTimeout(() => {
-      // setImmediate is added to make sure that we prioritize socket error events over timeouts
-        s1 = setImmediate(() => {
-          onConnectTimeout(socketWeakRef.deref(), opts)
-        })
-      }, opts.timeout)
-      return () => {
-        timers.clearFastTimeout(fastTimer)
-        clearImmediate(s1)
-      }
-    }
-
-/**
- * @param {net.Socket} socket
- * @param {object} opts
- * @param {number} opts.timeout
- * @param {string} opts.hostname
- * @param {number} opts.port
- */
-function onConnectTimeout (socket, opts) {
-  // The socket could be already garbage collected
-  if (socket == null) {
-    return
-  }
-
-  let message = 'Connect Timeout Error'
-  if (Array.isArray(socket.autoSelectFamilyAttemptedAddresses)) {
-    message += ` (attempted addresses: ${socket.autoSelectFamilyAttemptedAddresses.join(', ')},`
-  } else {
-    message += ` (attempted address: ${opts.hostname}:${opts.port},`
-  }
-
-  message += ` timeout: ${opts.timeout}ms)`
-
-  util.destroy(socket, new ConnectTimeoutError(message))
 }
 
 module.exports = buildConnector
@@ -29542,11 +29484,12 @@ const { Blob } = __nccwpck_require__(4573)
 const nodeUtil = __nccwpck_require__(7975)
 const { stringify } = __nccwpck_require__(1792)
 const { EventEmitter: EE } = __nccwpck_require__(8474)
-const { InvalidArgumentError } = __nccwpck_require__(8707)
+const timers = __nccwpck_require__(6603)
+const { InvalidArgumentError, ConnectTimeoutError } = __nccwpck_require__(8707)
 const { headerNameLowerCasedRecord } = __nccwpck_require__(735)
 const { tree } = __nccwpck_require__(7752)
 
-const [nodeMajor, nodeMinor] = process.versions.node.split('.').map(v => Number(v))
+const [nodeMajor, nodeMinor] = process.versions.node.split('.', 2).map(v => Number(v))
 
 class BodyAsyncIterable {
   constructor (body) {
@@ -29560,6 +29503,8 @@ class BodyAsyncIterable {
     yield * this[kBody]
   }
 }
+
+function noop () {}
 
 /**
  * @param {*} body
@@ -30133,20 +30078,25 @@ function ReadableStreamFrom (iterable) {
       async start () {
         iterator = iterable[Symbol.asyncIterator]()
       },
-      async pull (controller) {
-        const { done, value } = await iterator.next()
-        if (done) {
-          queueMicrotask(() => {
-            controller.close()
-            controller.byobRequest?.respond(0)
-          })
-        } else {
-          const buf = Buffer.isBuffer(value) ? value : Buffer.from(value)
-          if (buf.byteLength) {
-            controller.enqueue(new Uint8Array(buf))
+      pull (controller) {
+        async function pull () {
+          const { done, value } = await iterator.next()
+          if (done) {
+            queueMicrotask(() => {
+              controller.close()
+              controller.byobRequest?.respond(0)
+            })
+          } else {
+            const buf = Buffer.isBuffer(value) ? value : Buffer.from(value)
+            if (buf.byteLength) {
+              controller.enqueue(new Uint8Array(buf))
+            } else {
+              return await pull()
+            }
           }
         }
-        return controller.desiredSize > 0
+
+        return pull()
       },
       async cancel () {
         await iterator.return()
@@ -30365,6 +30315,78 @@ function errorRequest (client, request, err) {
   }
 }
 
+/**
+ * @param {WeakRef<net.Socket>} socketWeakRef
+ * @param {object} opts
+ * @param {number} opts.timeout
+ * @param {string} opts.hostname
+ * @param {number} opts.port
+ * @returns {() => void}
+ */
+const setupConnectTimeout = process.platform === 'win32'
+  ? (socketWeakRef, opts) => {
+      if (!opts.timeout) {
+        return noop
+      }
+
+      let s1 = null
+      let s2 = null
+      const fastTimer = timers.setFastTimeout(() => {
+      // setImmediate is added to make sure that we prioritize socket error events over timeouts
+        s1 = setImmediate(() => {
+        // Windows needs an extra setImmediate probably due to implementation differences in the socket logic
+          s2 = setImmediate(() => onConnectTimeout(socketWeakRef.deref(), opts))
+        })
+      }, opts.timeout)
+      return () => {
+        timers.clearFastTimeout(fastTimer)
+        clearImmediate(s1)
+        clearImmediate(s2)
+      }
+    }
+  : (socketWeakRef, opts) => {
+      if (!opts.timeout) {
+        return noop
+      }
+
+      let s1 = null
+      const fastTimer = timers.setFastTimeout(() => {
+      // setImmediate is added to make sure that we prioritize socket error events over timeouts
+        s1 = setImmediate(() => {
+          onConnectTimeout(socketWeakRef.deref(), opts)
+        })
+      }, opts.timeout)
+      return () => {
+        timers.clearFastTimeout(fastTimer)
+        clearImmediate(s1)
+      }
+    }
+
+/**
+ * @param {net.Socket} socket
+ * @param {object} opts
+ * @param {number} opts.timeout
+ * @param {string} opts.hostname
+ * @param {number} opts.port
+ */
+function onConnectTimeout (socket, opts) {
+  // The socket could be already garbage collected
+  if (socket == null) {
+    return
+  }
+
+  let message = 'Connect Timeout Error'
+  if (Array.isArray(socket.autoSelectFamilyAttemptedAddresses)) {
+    message += ` (attempted addresses: ${socket.autoSelectFamilyAttemptedAddresses.join(', ')},`
+  } else {
+    message += ` (attempted address: ${opts.hostname}:${opts.port},`
+  }
+
+  message += ` timeout: ${opts.timeout}ms)`
+
+  destroy(socket, new ConnectTimeoutError(message))
+}
+
 const kEnumerableProperty = Object.create(null)
 kEnumerableProperty.enumerable = true
 
@@ -30436,7 +30458,8 @@ module.exports = {
   nodeMajor,
   nodeMinor,
   safeHTTPMethods: Object.freeze(['GET', 'HEAD', 'OPTIONS', 'TRACE']),
-  wrapRequestBody
+  wrapRequestBody,
+  setupConnectTimeout
 }
 
 
@@ -32616,6 +32639,7 @@ function onHttp2SessionGoAway (errorCode) {
   assert(client[kRunning] === 0)
 
   client.emit('disconnect', client[kUrl], [client], err)
+  client.emit('connectionError', client[kUrl], [client], err)
 
   client[kResume]()
 }
@@ -33418,7 +33442,7 @@ class Client extends DispatcherBase {
         allowH2,
         socketPath,
         timeout: connectTimeout,
-        ...(autoSelectFamily ? { autoSelectFamily, autoSelectFamilyAttemptTimeout } : undefined),
+        ...(typeof autoSelectFamily === 'boolean' ? { autoSelectFamily, autoSelectFamilyAttemptTimeout } : undefined),
         ...connect
       })
     }
@@ -34063,8 +34087,6 @@ const DEFAULT_PORTS = {
   'https:': 443
 }
 
-let experimentalWarned = false
-
 class EnvHttpProxyAgent extends DispatcherBase {
   #noProxyValue = null
   #noProxyEntries = null
@@ -34073,13 +34095,6 @@ class EnvHttpProxyAgent extends DispatcherBase {
   constructor (opts = {}) {
     super()
     this.#opts = opts
-
-    if (!experimentalWarned) {
-      experimentalWarned = true
-      process.emitWarning('EnvHttpProxyAgent is experimental, expect them to change at any time.', {
-        code: 'UNDICI-EHPA'
-      })
-    }
 
     const { httpProxy, httpsProxy, noProxy, ...agentOpts } = opts
 
@@ -34378,6 +34393,136 @@ module.exports = class FixedQueue {
     return next
   }
 }
+
+
+/***/ }),
+
+/***/ 6815:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+const { connect } = __nccwpck_require__(7030)
+
+const { kClose, kDestroy } = __nccwpck_require__(6443)
+const { InvalidArgumentError } = __nccwpck_require__(8707)
+const util = __nccwpck_require__(3440)
+
+const Client = __nccwpck_require__(3701)
+const DispatcherBase = __nccwpck_require__(1841)
+
+class H2CClient extends DispatcherBase {
+  #client = null
+
+  constructor (origin, clientOpts) {
+    super()
+
+    if (typeof origin === 'string') {
+      origin = new URL(origin)
+    }
+
+    if (origin.protocol !== 'http:') {
+      throw new InvalidArgumentError(
+        'h2c-client: Only h2c protocol is supported'
+      )
+    }
+
+    const { connect, maxConcurrentStreams, pipelining, ...opts } =
+      clientOpts ?? {}
+    let defaultMaxConcurrentStreams = 100
+    let defaultPipelining = 100
+
+    if (
+      maxConcurrentStreams != null &&
+      Number.isInteger(maxConcurrentStreams) &&
+      maxConcurrentStreams > 0
+    ) {
+      defaultMaxConcurrentStreams = maxConcurrentStreams
+    }
+
+    if (pipelining != null && Number.isInteger(pipelining) && pipelining > 0) {
+      defaultPipelining = pipelining
+    }
+
+    if (defaultPipelining > defaultMaxConcurrentStreams) {
+      throw new InvalidArgumentError(
+        'h2c-client: pipelining cannot be greater than maxConcurrentStreams'
+      )
+    }
+
+    this.#client = new Client(origin, {
+      ...opts,
+      connect: this.#buildConnector(connect),
+      maxConcurrentStreams: defaultMaxConcurrentStreams,
+      pipelining: defaultPipelining,
+      allowH2: true
+    })
+  }
+
+  #buildConnector (connectOpts) {
+    return (opts, callback) => {
+      const timeout = connectOpts?.connectOpts ?? 10e3
+      const { hostname, port, pathname } = opts
+      const socket = connect({
+        ...opts,
+        host: hostname,
+        port,
+        pathname
+      })
+
+      // Set TCP keep alive options on the socket here instead of in connect() for the case of assigning the socket
+      if (opts.keepAlive == null || opts.keepAlive) {
+        const keepAliveInitialDelay =
+          opts.keepAliveInitialDelay == null ? 60e3 : opts.keepAliveInitialDelay
+        socket.setKeepAlive(true, keepAliveInitialDelay)
+      }
+
+      socket.alpnProtocol = 'h2'
+
+      const clearConnectTimeout = util.setupConnectTimeout(
+        new WeakRef(socket),
+        { timeout, hostname, port }
+      )
+
+      socket
+        .setNoDelay(true)
+        .once('connect', function () {
+          queueMicrotask(clearConnectTimeout)
+
+          if (callback) {
+            const cb = callback
+            callback = null
+            cb(null, this)
+          }
+        })
+        .on('error', function (err) {
+          queueMicrotask(clearConnectTimeout)
+
+          if (callback) {
+            const cb = callback
+            callback = null
+            cb(err)
+          }
+        })
+
+      return socket
+    }
+  }
+
+  dispatch (opts, handler) {
+    return this.#client.dispatch(opts, handler)
+  }
+
+  async [kClose] () {
+    await this.#client.close()
+  }
+
+  async [kDestroy] () {
+    await this.#client.destroy()
+  }
+}
+
+module.exports = H2CClient
 
 
 /***/ }),
@@ -34692,7 +34837,7 @@ class Pool extends PoolBase {
         allowH2,
         socketPath,
         timeout: connectTimeout,
-        ...(autoSelectFamily ? { autoSelectFamily, autoSelectFamilyAttemptTimeout } : undefined),
+        ...(typeof autoSelectFamily === 'boolean' ? { autoSelectFamily, autoSelectFamilyAttemptTimeout } : undefined),
         ...connect
       })
     }
@@ -34704,6 +34849,20 @@ class Pool extends PoolBase {
       ? { ...options.interceptors }
       : undefined
     this[kFactory] = factory
+
+    this.on('connectionError', (origin, targets, error) => {
+      // If a connection error occurs, we remove the client from the pool,
+      // and emit a connectionError event. They will not be re-used.
+      // Fixes https://github.com/nodejs/undici/issues/3895
+      for (const target of targets) {
+        // Do not use kRemoveClient here, as it will close the client,
+        // but the client cannot be closed in this state.
+        const idx = this[kClients].indexOf(target)
+        if (idx !== -1) {
+          this[kClients].splice(idx, 1)
+        }
+      }
+    })
   }
 
   [kGetDispatcher] () {
@@ -35477,7 +35636,7 @@ const assert = __nccwpck_require__(4589)
  *  here, which we then just pass on to the next handler (most likely a
  *  CacheHandler). Note that this assumes the proper headers were already
  *  included in the request to tell the origin that we want to revalidate the
- *  response (i.e. if-modified-since).
+ *  response (i.e. if-modified-since or if-none-match).
  *
  * @see https://www.rfc-editor.org/rfc/rfc9111.html#name-validation
  *
@@ -35921,8 +36080,8 @@ const {
 } = __nccwpck_require__(3440)
 
 function calculateRetryAfterHeader (retryAfter) {
-  const current = Date.now()
-  return new Date(retryAfter).getTime() - current
+  const retryTime = new Date(retryAfter).getTime()
+  return isNaN(retryTime) ? 0 : retryTime - Date.now()
 }
 
 class RetryHandler {
@@ -36034,7 +36193,7 @@ class RetryHandler {
     if (retryAfterHeader) {
       retryAfterHeader = Number(retryAfterHeader)
       retryAfterHeader = Number.isNaN(retryAfterHeader)
-        ? calculateRetryAfterHeader(retryAfterHeader)
+        ? calculateRetryAfterHeader(headers['retry-after'])
         : retryAfterHeader * 1e3 // Retry-After is in seconds
     }
 
@@ -36043,7 +36202,7 @@ class RetryHandler {
         ? Math.min(retryAfterHeader, maxTimeout)
         : Math.min(minTimeout * timeoutFactor ** (counter - 1), maxTimeout)
 
-    setTimeout(() => cb(null), retryTimeout).unref()
+    setTimeout(() => cb(null), retryTimeout)
   }
 
   onResponseStart (controller, statusCode, headers, statusMessage) {
@@ -36187,7 +36346,7 @@ class RetryHandler {
   }
 
   onResponseError (controller, err) {
-    if (!controller || controller.aborted || isDisturbed(this.opts.body)) {
+    if (controller?.aborted || isDisturbed(this.opts.body)) {
       this.handler.onResponseError?.(controller, err)
       return
     }
@@ -36473,7 +36632,7 @@ const util = __nccwpck_require__(3440)
 const CacheHandler = __nccwpck_require__(9976)
 const MemoryCacheStore = __nccwpck_require__(4889)
 const CacheRevalidationHandler = __nccwpck_require__(7133)
-const { assertCacheStore, assertCacheMethods, makeCacheKey, parseCacheControlHeader } = __nccwpck_require__(7659)
+const { assertCacheStore, assertCacheMethods, makeCacheKey, normaliseHeaders, parseCacheControlHeader } = __nccwpck_require__(7659)
 const { AbortError } = __nccwpck_require__(8707)
 
 /**
@@ -36688,7 +36847,7 @@ function handleResult (
   // Check if the response is stale
   if (needsRevalidation(result, reqCacheControl)) {
     if (util.isStream(opts.body) && util.bodyLength(opts.body) !== 0) {
-      // If body is is stream we can't revalidate...
+      // If body is a stream we can't revalidate...
       // TODO (fix): This could be less strict...
       return dispatch(opts, new CacheHandler(globalOpts, cacheKey, handler))
     }
@@ -36700,7 +36859,7 @@ function handleResult (
     }
 
     let headers = {
-      ...opts.headers,
+      ...normaliseHeaders(opts),
       'if-modified-since': new Date(result.cachedAt).toUTCString()
     }
 
@@ -36869,7 +37028,7 @@ class DNSInstance {
 
     // If full, we just return the origin
     if (ips == null && this.full) {
-      cb(null, origin.origin)
+      cb(null, origin)
       return
     }
 
@@ -36911,9 +37070,9 @@ class DNSInstance {
 
         cb(
           null,
-          `${origin.protocol}//${
+          new URL(`${origin.protocol}//${
             ip.family === 6 ? `[${ip.address}]` : ip.address
-          }${port}`
+          }${port}`)
         )
       })
     } else {
@@ -36942,9 +37101,9 @@ class DNSInstance {
 
       cb(
         null,
-        `${origin.protocol}//${
+        new URL(`${origin.protocol}//${
           ip.family === 6 ? `[${ip.address}]` : ip.address
-        }${port}`
+        }${port}`)
       )
     }
   }
@@ -37029,6 +37188,38 @@ class DNSInstance {
     return ip
   }
 
+  pickFamily (origin, ipFamily) {
+    const records = this.#records.get(origin.hostname)?.records
+    if (!records) {
+      return null
+    }
+
+    const family = records[ipFamily]
+    if (!family) {
+      return null
+    }
+
+    if (family.offset == null || family.offset === maxInt) {
+      family.offset = 0
+    } else {
+      family.offset++
+    }
+
+    const position = family.offset % family.ips.length
+    const ip = family.ips[position] ?? null
+    if (ip == null) {
+      return ip
+    }
+
+    if (Date.now() - ip.timestamp > ip.ttl) { // record TTL is already in ms
+      // We delete expired records
+      // It is possible that they have different TTL, so we manage them individually
+      family.ips.splice(position, 1)
+    }
+
+    return ip
+  }
+
   setRecords (origin, addresses) {
     const timestamp = Date.now()
     const records = { records: { 4: null, 6: null } }
@@ -37065,10 +37256,13 @@ class DNSDispatchHandler extends DecoratorHandler {
   #dispatch = null
   #origin = null
   #controller = null
+  #newOrigin = null
+  #firstTry = true
 
-  constructor (state, { origin, handler, dispatch }, opts) {
+  constructor (state, { origin, handler, dispatch, newOrigin }, opts) {
     super(handler)
     this.#origin = origin
+    this.#newOrigin = newOrigin
     this.#opts = { ...opts }
     this.#state = state
     this.#dispatch = dispatch
@@ -37079,21 +37273,36 @@ class DNSDispatchHandler extends DecoratorHandler {
       case 'ETIMEDOUT':
       case 'ECONNREFUSED': {
         if (this.#state.dualStack) {
-          // We delete the record and retry
-          this.#state.runLookup(this.#origin, this.#opts, (err, newOrigin) => {
-            if (err) {
-              super.onResponseError(controller, err)
-              return
-            }
+          if (!this.#firstTry) {
+            super.onResponseError(controller, err)
+            return
+          }
+          this.#firstTry = false
 
-            const dispatchOpts = {
-              ...this.#opts,
-              origin: newOrigin
-            }
+          // Pick an ip address from the other family
+          const otherFamily = this.#newOrigin.hostname[0] === '[' ? 4 : 6
+          const ip = this.#state.pickFamily(this.#origin, otherFamily)
+          if (ip == null) {
+            super.onResponseError(controller, err)
+            return
+          }
 
-            this.#dispatch(dispatchOpts, this)
-          })
+          let port
+          if (typeof ip.port === 'number') {
+            port = `:${ip.port}`
+          } else if (this.#origin.port !== '') {
+            port = `:${this.#origin.port}`
+          } else {
+            port = ''
+          }
 
+          const dispatchOpts = {
+            ...this.#opts,
+            origin: `${this.#origin.protocol}//${
+                ip.family === 6 ? `[${ip.address}]` : ip.address
+              }${port}`
+          }
+          this.#dispatch(dispatchOpts, this)
           return
         }
 
@@ -37103,7 +37312,8 @@ class DNSDispatchHandler extends DecoratorHandler {
       }
       case 'ENOTFOUND':
         this.#state.deleteRecords(this.#origin)
-      // eslint-disable-next-line no-fallthrough
+        super.onResponseError(controller, err)
+        break
       default:
         super.onResponseError(controller, err)
         break
@@ -37190,14 +37400,13 @@ module.exports = interceptorOpts => {
 
       instance.runLookup(origin, origDispatchOpts, (err, newOrigin) => {
         if (err) {
-          return handler.onError(err)
+          return handler.onResponseError(null, err)
         }
 
-        let dispatchOpts = null
-        dispatchOpts = {
+        const dispatchOpts = {
           ...origDispatchOpts,
           servername: origin.hostname, // For SNI on TLS
-          origin: newOrigin,
+          origin: newOrigin.origin,
           headers: {
             host: origin.host,
             ...origDispatchOpts.headers
@@ -37206,7 +37415,10 @@ module.exports = interceptorOpts => {
 
         dispatch(
           dispatchOpts,
-          instance.getHandler({ origin, dispatch, handler }, origDispatchOpts)
+          instance.getHandler(
+            { origin, dispatch, handler, newOrigin },
+            origDispatchOpts
+          )
         )
       })
 
@@ -38088,31 +38300,44 @@ const {
   kNetConnect,
   kGetNetConnect,
   kOptions,
-  kFactory
+  kFactory,
+  kMockAgentRegisterCallHistory,
+  kMockAgentIsCallHistoryEnabled,
+  kMockAgentAddCallHistoryLog,
+  kMockAgentMockCallHistoryInstance,
+  kMockCallHistoryAddLog
 } = __nccwpck_require__(1117)
 const MockClient = __nccwpck_require__(7365)
 const MockPool = __nccwpck_require__(4004)
-const { matchValue, buildMockOptions } = __nccwpck_require__(3397)
+const { matchValue, buildAndValidateMockOptions } = __nccwpck_require__(3397)
 const { InvalidArgumentError, UndiciError } = __nccwpck_require__(8707)
 const Dispatcher = __nccwpck_require__(883)
 const PendingInterceptorsFormatter = __nccwpck_require__(6142)
+const { MockCallHistory } = __nccwpck_require__(431)
 
 class MockAgent extends Dispatcher {
   constructor (opts) {
     super(opts)
 
+    const mockOptions = buildAndValidateMockOptions(opts)
+
     this[kNetConnect] = true
     this[kIsMockActive] = true
+    this[kMockAgentIsCallHistoryEnabled] = mockOptions?.enableCallHistory ?? false
 
     // Instantiate Agent and encapsulate
-    if ((opts?.agent && typeof opts.agent.dispatch !== 'function')) {
+    if (opts?.agent && typeof opts.agent.dispatch !== 'function') {
       throw new InvalidArgumentError('Argument opts.agent must implement Agent')
     }
     const agent = opts?.agent ? opts.agent : new Agent(opts)
     this[kAgent] = agent
 
     this[kClients] = agent[kClients]
-    this[kOptions] = buildMockOptions(opts)
+    this[kOptions] = mockOptions
+
+    if (this[kMockAgentIsCallHistoryEnabled]) {
+      this[kMockAgentRegisterCallHistory]()
+    }
   }
 
   get (origin) {
@@ -38128,10 +38353,14 @@ class MockAgent extends Dispatcher {
   dispatch (opts, handler) {
     // Call MockAgent.get to perform additional setup before dispatching as normal
     this.get(opts.origin)
+
+    this[kMockAgentAddCallHistoryLog](opts)
+
     return this[kAgent].dispatch(opts, handler)
   }
 
   async close () {
+    this.clearCallHistory()
     await this[kAgent].close()
     this[kClients].clear()
   }
@@ -38162,10 +38391,48 @@ class MockAgent extends Dispatcher {
     this[kNetConnect] = false
   }
 
+  enableCallHistory () {
+    this[kMockAgentIsCallHistoryEnabled] = true
+
+    return this
+  }
+
+  disableCallHistory () {
+    this[kMockAgentIsCallHistoryEnabled] = false
+
+    return this
+  }
+
+  getCallHistory () {
+    return this[kMockAgentMockCallHistoryInstance]
+  }
+
+  clearCallHistory () {
+    if (this[kMockAgentMockCallHistoryInstance] !== undefined) {
+      this[kMockAgentMockCallHistoryInstance].clear()
+    }
+  }
+
   // This is required to bypass issues caused by using global symbols - see:
   // https://github.com/nodejs/undici/issues/1447
   get isMockActive () {
     return this[kIsMockActive]
+  }
+
+  [kMockAgentRegisterCallHistory] () {
+    if (this[kMockAgentMockCallHistoryInstance] === undefined) {
+      this[kMockAgentMockCallHistoryInstance] = new MockCallHistory()
+    }
+  }
+
+  [kMockAgentAddCallHistoryLog] (opts) {
+    if (this[kMockAgentIsCallHistoryEnabled]) {
+      // additional setup when enableCallHistory class method is used after mockAgent instantiation
+      this[kMockAgentRegisterCallHistory]()
+
+      // add call history log on every call (intercepted or not)
+      this[kMockAgentMockCallHistoryInstance][kMockCallHistoryAddLog](opts)
+    }
   }
 
   [kMockAgentSet] (origin, dispatcher) {
@@ -38232,6 +38499,262 @@ class MockAgent extends Dispatcher {
 }
 
 module.exports = MockAgent
+
+
+/***/ }),
+
+/***/ 431:
+/***/ ((module, __unused_webpack_exports, __nccwpck_require__) => {
+
+"use strict";
+
+
+const { kMockCallHistoryAddLog } = __nccwpck_require__(1117)
+const { InvalidArgumentError } = __nccwpck_require__(8707)
+
+function handleFilterCallsWithOptions (criteria, options, handler, store) {
+  switch (options.operator) {
+    case 'OR':
+      store.push(...handler(criteria))
+
+      return store
+    case 'AND':
+      return handler.call({ logs: store }, criteria)
+    default:
+      // guard -- should never happens because buildAndValidateFilterCallsOptions is called before
+      throw new InvalidArgumentError('options.operator must to be a case insensitive string equal to \'OR\' or \'AND\'')
+  }
+}
+
+function buildAndValidateFilterCallsOptions (options = {}) {
+  const finalOptions = {}
+
+  if ('operator' in options) {
+    if (typeof options.operator !== 'string' || (options.operator.toUpperCase() !== 'OR' && options.operator.toUpperCase() !== 'AND')) {
+      throw new InvalidArgumentError('options.operator must to be a case insensitive string equal to \'OR\' or \'AND\'')
+    }
+
+    return {
+      ...finalOptions,
+      operator: options.operator.toUpperCase()
+    }
+  }
+
+  return finalOptions
+}
+
+function makeFilterCalls (parameterName) {
+  return (parameterValue) => {
+    if (typeof parameterValue === 'string' || parameterValue == null) {
+      return this.logs.filter((log) => {
+        return log[parameterName] === parameterValue
+      })
+    }
+    if (parameterValue instanceof RegExp) {
+      return this.logs.filter((log) => {
+        return parameterValue.test(log[parameterName])
+      })
+    }
+
+    throw new InvalidArgumentError(`${parameterName} parameter should be one of string, regexp, undefined or null`)
+  }
+}
+function computeUrlWithMaybeSearchParameters (requestInit) {
+  // path can contains query url parameters
+  // or query can contains query url parameters
+  try {
+    const url = new URL(requestInit.path, requestInit.origin)
+
+    // requestInit.path contains query url parameters
+    // requestInit.query is then undefined
+    if (url.search.length !== 0) {
+      return url
+    }
+
+    // requestInit.query can be populated here
+    url.search = new URLSearchParams(requestInit.query).toString()
+
+    return url
+  } catch (error) {
+    throw new InvalidArgumentError('An error occurred when computing MockCallHistoryLog.url', { cause: error })
+  }
+}
+
+class MockCallHistoryLog {
+  constructor (requestInit = {}) {
+    this.body = requestInit.body
+    this.headers = requestInit.headers
+    this.method = requestInit.method
+
+    const url = computeUrlWithMaybeSearchParameters(requestInit)
+
+    this.fullUrl = url.toString()
+    this.origin = url.origin
+    this.path = url.pathname
+    this.searchParams = Object.fromEntries(url.searchParams)
+    this.protocol = url.protocol
+    this.host = url.host
+    this.port = url.port
+    this.hash = url.hash
+  }
+
+  toMap () {
+    return new Map([
+      ['protocol', this.protocol],
+      ['host', this.host],
+      ['port', this.port],
+      ['origin', this.origin],
+      ['path', this.path],
+      ['hash', this.hash],
+      ['searchParams', this.searchParams],
+      ['fullUrl', this.fullUrl],
+      ['method', this.method],
+      ['body', this.body],
+      ['headers', this.headers]]
+    )
+  }
+
+  toString () {
+    const options = { betweenKeyValueSeparator: '->', betweenPairSeparator: '|' }
+    let result = ''
+
+    this.toMap().forEach((value, key) => {
+      if (typeof value === 'string' || value === undefined || value === null) {
+        result = `${result}${key}${options.betweenKeyValueSeparator}${value}${options.betweenPairSeparator}`
+      }
+      if ((typeof value === 'object' && value !== null) || Array.isArray(value)) {
+        result = `${result}${key}${options.betweenKeyValueSeparator}${JSON.stringify(value)}${options.betweenPairSeparator}`
+      }
+      // maybe miss something for non Record / Array headers and searchParams here
+    })
+
+    // delete last betweenPairSeparator
+    return result.slice(0, -1)
+  }
+}
+
+class MockCallHistory {
+  logs = []
+
+  calls () {
+    return this.logs
+  }
+
+  firstCall () {
+    return this.logs.at(0)
+  }
+
+  lastCall () {
+    return this.logs.at(-1)
+  }
+
+  nthCall (number) {
+    if (typeof number !== 'number') {
+      throw new InvalidArgumentError('nthCall must be called with a number')
+    }
+    if (!Number.isInteger(number)) {
+      throw new InvalidArgumentError('nthCall must be called with an integer')
+    }
+    if (Math.sign(number) !== 1) {
+      throw new InvalidArgumentError('nthCall must be called with a positive value. use firstCall or lastCall instead')
+    }
+
+    // non zero based index. this is more human readable
+    return this.logs.at(number - 1)
+  }
+
+  filterCalls (criteria, options) {
+    // perf
+    if (this.logs.length === 0) {
+      return this.logs
+    }
+    if (typeof criteria === 'function') {
+      return this.logs.filter(criteria)
+    }
+    if (criteria instanceof RegExp) {
+      return this.logs.filter((log) => {
+        return criteria.test(log.toString())
+      })
+    }
+    if (typeof criteria === 'object' && criteria !== null) {
+      // no criteria - returning all logs
+      if (Object.keys(criteria).length === 0) {
+        return this.logs
+      }
+
+      const finalOptions = { operator: 'OR', ...buildAndValidateFilterCallsOptions(options) }
+
+      let maybeDuplicatedLogsFiltered = []
+      if ('protocol' in criteria) {
+        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.protocol, finalOptions, this.filterCallsByProtocol, maybeDuplicatedLogsFiltered)
+      }
+      if ('host' in criteria) {
+        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.host, finalOptions, this.filterCallsByHost, maybeDuplicatedLogsFiltered)
+      }
+      if ('port' in criteria) {
+        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.port, finalOptions, this.filterCallsByPort, maybeDuplicatedLogsFiltered)
+      }
+      if ('origin' in criteria) {
+        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.origin, finalOptions, this.filterCallsByOrigin, maybeDuplicatedLogsFiltered)
+      }
+      if ('path' in criteria) {
+        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.path, finalOptions, this.filterCallsByPath, maybeDuplicatedLogsFiltered)
+      }
+      if ('hash' in criteria) {
+        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.hash, finalOptions, this.filterCallsByHash, maybeDuplicatedLogsFiltered)
+      }
+      if ('fullUrl' in criteria) {
+        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.fullUrl, finalOptions, this.filterCallsByFullUrl, maybeDuplicatedLogsFiltered)
+      }
+      if ('method' in criteria) {
+        maybeDuplicatedLogsFiltered = handleFilterCallsWithOptions(criteria.method, finalOptions, this.filterCallsByMethod, maybeDuplicatedLogsFiltered)
+      }
+
+      const uniqLogsFiltered = [...new Set(maybeDuplicatedLogsFiltered)]
+
+      return uniqLogsFiltered
+    }
+
+    throw new InvalidArgumentError('criteria parameter should be one of function, regexp, or object')
+  }
+
+  filterCallsByProtocol = makeFilterCalls.call(this, 'protocol')
+
+  filterCallsByHost = makeFilterCalls.call(this, 'host')
+
+  filterCallsByPort = makeFilterCalls.call(this, 'port')
+
+  filterCallsByOrigin = makeFilterCalls.call(this, 'origin')
+
+  filterCallsByPath = makeFilterCalls.call(this, 'path')
+
+  filterCallsByHash = makeFilterCalls.call(this, 'hash')
+
+  filterCallsByFullUrl = makeFilterCalls.call(this, 'fullUrl')
+
+  filterCallsByMethod = makeFilterCalls.call(this, 'method')
+
+  clear () {
+    this.logs = []
+  }
+
+  [kMockCallHistoryAddLog] (requestInit) {
+    const log = new MockCallHistoryLog(requestInit)
+
+    this.logs.push(log)
+
+    return log
+  }
+
+  * [Symbol.iterator] () {
+    for (const log of this.calls()) {
+      yield log
+    }
+  }
+}
+
+module.exports.MockCallHistory = MockCallHistory
+module.exports.MockCallHistoryLog = MockCallHistoryLog
 
 
 /***/ }),
@@ -38651,7 +39174,12 @@ module.exports = {
   kNetConnect: Symbol('net connect'),
   kGetNetConnect: Symbol('get net connect'),
   kConnected: Symbol('connected'),
-  kIgnoreTrailingSlash: Symbol('ignore trailing slash')
+  kIgnoreTrailingSlash: Symbol('ignore trailing slash'),
+  kMockAgentMockCallHistoryInstance: Symbol('mock agent mock call history name'),
+  kMockAgentRegisterCallHistory: Symbol('mock agent register mock call history'),
+  kMockAgentAddCallHistoryLog: Symbol('mock agent add call history log'),
+  kMockAgentIsCallHistoryEnabled: Symbol('mock agent is call history enabled'),
+  kMockCallHistoryAddLog: Symbol('mock call history add log')
 }
 
 
@@ -38678,6 +39206,7 @@ const {
     isPromise
   }
 } = __nccwpck_require__(7975)
+const { InvalidArgumentError } = __nccwpck_require__(8707)
 
 function matchValue (match, value) {
   if (typeof match === 'string') {
@@ -38759,7 +39288,7 @@ function safeUrl (path) {
     return path
   }
 
-  const pathSegments = path.split('?')
+  const pathSegments = path.split('?', 3)
 
   if (pathSegments.length !== 2) {
     return path
@@ -38787,8 +39316,10 @@ function getResponseData (data) {
     return data
   } else if (typeof data === 'object') {
     return JSON.stringify(data)
-  } else {
+  } else if (data) {
     return data.toString()
+  } else {
+    return ''
   }
 }
 
@@ -39028,9 +39559,14 @@ function checkNetConnect (netConnect, origin) {
   return false
 }
 
-function buildMockOptions (opts) {
+function buildAndValidateMockOptions (opts) {
   if (opts) {
     const { agent, ...mockOptions } = opts
+
+    if ('enableCallHistory' in mockOptions && typeof mockOptions.enableCallHistory !== 'boolean') {
+      throw new InvalidArgumentError('options.enableCallHistory must to be a boolean')
+    }
+
     return mockOptions
   }
 }
@@ -39048,7 +39584,7 @@ module.exports = {
   mockDispatch,
   buildMockDispatch,
   checkNetConnect,
-  buildMockOptions,
+  buildAndValidateMockOptions,
   getHeaderByName,
   buildHeadersFromArray
 }
@@ -39125,7 +39661,21 @@ function makeCacheKey (opts) {
     throw new Error('opts.origin is undefined')
   }
 
-  /** @type {Record<string, string[] | string>} */
+  const headers = normaliseHeaders(opts)
+
+  return {
+    origin: opts.origin.toString(),
+    method: opts.method,
+    path: opts.path,
+    headers
+  }
+}
+
+/**
+ * @param {Record<string, string[] | string>}
+ * @return {Record<string, string[] | string>}
+ */
+function normaliseHeaders (opts) {
   let headers
   if (opts.headers == null) {
     headers = {}
@@ -39139,20 +39689,19 @@ function makeCacheKey (opts) {
       if (typeof key !== 'string' || typeof val !== 'string') {
         throw new Error('opts.headers is not a valid header map')
       }
-      headers[key] = val
+      headers[key.toLowerCase()] = val
     }
   } else if (typeof opts.headers === 'object') {
-    headers = opts.headers
+    headers = {}
+
+    for (const key of Object.keys(opts.headers)) {
+      headers[key.toLowerCase()] = opts.headers[key]
+    }
   } else {
     throw new Error('opts.headers is not an object')
   }
 
-  return {
-    origin: opts.origin.toString(),
-    method: opts.method,
-    path: opts.path,
-    headers
-  }
+  return headers
 }
 
 /**
@@ -39373,19 +39922,16 @@ function parseVaryHeader (varyHeader, headers) {
     return headers
   }
 
-  const output = /** @type {Record<string, string | string[]>} */ ({})
+  const output = /** @type {Record<string, string | string[] | null>} */ ({})
 
   const varyingHeaders = typeof varyHeader === 'string'
     ? varyHeader.split(',')
     : varyHeader
+
   for (const header of varyingHeaders) {
     const trimmedHeader = header.trim().toLowerCase()
 
-    if (headers[trimmedHeader]) {
-      output[trimmedHeader] = headers[trimmedHeader]
-    } else {
-      return undefined
-    }
+    output[trimmedHeader] = headers[trimmedHeader] ?? null
   }
 
   return output
@@ -39462,6 +40008,7 @@ function assertCacheMethods (methods, name = 'CacheMethods') {
 
 module.exports = {
   makeCacheKey,
+  normaliseHeaders,
   assertCacheKey,
   assertCacheValue,
   parseCacheControlHeader,
@@ -43069,6 +43616,14 @@ const { isErrored, isDisturbed } = __nccwpck_require__(7075)
 const { isArrayBuffer } = __nccwpck_require__(3429)
 const { serializeAMimeType } = __nccwpck_require__(1900)
 const { multipartFormDataParser } = __nccwpck_require__(116)
+let random
+
+try {
+  const crypto = __nccwpck_require__(7598)
+  random = (max) => crypto.randomInt(0, max)
+} catch {
+  random = (max) => Math.floor(Math.random() * max)
+}
 
 const textEncoder = new TextEncoder()
 function noop () {}
@@ -43162,7 +43717,7 @@ function extractBody (object, keepalive = false) {
     // Set source to a copy of the bytes held by object.
     source = new Uint8Array(object.buffer.slice(object.byteOffset, object.byteOffset + object.byteLength))
   } else if (webidl.is.FormData(object)) {
-    const boundary = `----formdata-undici-0${`${Math.floor(Math.random() * 1e11)}`.padStart(11, '0')}`
+    const boundary = `----formdata-undici-0${`${random(1e11)}`.padStart(11, '0')}`
     const prefix = `--${boundary}\r\nContent-Disposition: form-data`
 
     /*! formdata-polyfill. MIT License. Jimmy Wärting <https://jimmy.warting.se/opensource> */
@@ -46393,7 +46948,9 @@ function finalizeAndReportTiming (response, initiatorType = 'other') {
     originalURL.href,
     initiatorType,
     globalThis,
-    cacheState
+    cacheState,
+    '', // bodyType
+    response.status
   )
 }
 
@@ -47078,7 +47635,7 @@ function fetchFinale (fetchParams, response) {
     // 3. Set fetchParams’s controller’s report timing steps to the following steps given a global object global:
     fetchParams.controller.reportTimingSteps = () => {
       // 1. If fetchParams’s request’s URL’s scheme is not an HTTP(S) scheme, then return.
-      if (fetchParams.request.url.protocol !== 'https:') {
+      if (!urlIsHttpHttpsScheme(fetchParams.request.url)) {
         return
       }
 
@@ -47120,7 +47677,6 @@ function fetchFinale (fetchParams, response) {
       //    fetchParams’s request’s URL, fetchParams’s request’s initiator type, global, cacheState, bodyInfo,
       //    and responseStatus.
       if (fetchParams.request.initiatorType != null) {
-        // TODO: update markresourcetiming
         markResourceTiming(timingInfo, fetchParams.request.url.href, fetchParams.request.initiatorType, globalThis, cacheState, bodyInfo, responseStatus)
       }
     }
@@ -48386,6 +48942,14 @@ const requestFinalizer = new FinalizationRegistry(({ signal, abort }) => {
 
 const dependentControllerMap = new WeakMap()
 
+let abortSignalHasEventHandlerLeakWarning
+
+try {
+  abortSignalHasEventHandlerLeakWarning = getMaxListeners(new AbortController().signal) > 0
+} catch {
+  abortSignalHasEventHandlerLeakWarning = false
+}
+
 function buildAbort (acRef) {
   return abort
 
@@ -48773,15 +49337,10 @@ class Request {
         const acRef = new WeakRef(ac)
         const abort = buildAbort(acRef)
 
-        // Third-party AbortControllers may not work with these.
-        // See, https://github.com/nodejs/undici/pull/1910#issuecomment-1464495619.
-        try {
-          // If the max amount of listeners is equal to the default, increase it
-          // This is only available in node >= v19.9.0
-          if (typeof getMaxListeners === 'function' && getMaxListeners(signal) === defaultMaxListeners) {
-            setMaxListeners(1500, signal)
-          }
-        } catch {}
+        // If the max amount of listeners is equal to the default, increase it
+        if (abortSignalHasEventHandlerLeakWarning && getMaxListeners(signal) === defaultMaxListeners) {
+          setMaxListeners(1500, signal)
+        }
 
         util.addAbortListener(signal, abort)
         // The third argument must be a registry key to be unregistered.
@@ -52636,7 +53195,7 @@ module.exports = {
 
 
 const { uid, states, sentCloseFrameState, emptyBuffer, opcodes } = __nccwpck_require__(736)
-const { failWebsocketConnection, parseExtensions, isClosed, isClosing, isEstablished, validateCloseCodeAndReason } = __nccwpck_require__(8625)
+const { parseExtensions, isClosed, isClosing, isEstablished, validateCloseCodeAndReason } = __nccwpck_require__(8625)
 const { channels } = __nccwpck_require__(2414)
 const { makeRequest } = __nccwpck_require__(9967)
 const { fetching } = __nccwpck_require__(4398)
@@ -52929,8 +53488,33 @@ function closeWebSocketConnection (object, code, reason, validate = false) {
   }
 }
 
+/**
+ * @param {import('./websocket').Handler} handler
+ * @param {number} code
+ * @param {string|undefined} reason
+ * @returns {void}
+ */
+function failWebsocketConnection (handler, code, reason) {
+  // If _The WebSocket Connection is Established_ prior to the point where
+  // the endpoint is required to _Fail the WebSocket Connection_, the
+  // endpoint SHOULD send a Close frame with an appropriate status code
+  // (Section 7.4) before proceeding to _Close the WebSocket Connection_.
+  if (isEstablished(handler.readyState)) {
+    closeWebSocketConnection(handler, code, reason, false)
+  }
+
+  handler.controller.abort()
+
+  if (handler.socket?.destroyed === false) {
+    handler.socket.destroy()
+  }
+
+  handler.onFail(code, reason)
+}
+
 module.exports = {
   establishWebSocketConnection,
+  failWebsocketConnection,
   closeWebSocketConnection
 }
 
@@ -53647,13 +54231,13 @@ const { channels } = __nccwpck_require__(2414)
 const {
   isValidStatusCode,
   isValidOpcode,
-  failWebsocketConnection,
   websocketMessageReceived,
   utf8Decode,
   isControlFrame,
   isTextBinaryFrame,
   isContinuationFrame
 } = __nccwpck_require__(8625)
+const { failWebsocketConnection } = __nccwpck_require__(6897)
 const { WebsocketFrameSend } = __nccwpck_require__(3264)
 const { PerMessageDeflate } = __nccwpck_require__(9469)
 
@@ -53664,6 +54248,7 @@ const { PerMessageDeflate } = __nccwpck_require__(9469)
 
 class ByteParser extends Writable {
   #buffers = []
+  #fragmentsBytes = 0
   #byteOffset = 0
   #loop = false
 
@@ -53848,16 +54433,14 @@ class ByteParser extends Writable {
           this.#state = parserStates.INFO
         } else {
           if (!this.#info.compressed) {
-            this.#fragments.push(body)
+            this.writeFragments(body)
 
             // If the frame is not fragmented, a message has been received.
             // If the frame is fragmented, it will terminate with a fin bit set
             // and an opcode of 0 (continuation), therefore we handle that when
             // parsing continuation frames, not here.
             if (!this.#info.fragmented && this.#info.fin) {
-              const fullMessage = Buffer.concat(this.#fragments)
-              websocketMessageReceived(this.#handler, this.#info.binaryType, fullMessage)
-              this.#fragments.length = 0
+              websocketMessageReceived(this.#handler, this.#info.binaryType, this.consumeFragments())
             }
 
             this.#state = parserStates.INFO
@@ -53868,7 +54451,7 @@ class ByteParser extends Writable {
                 return
               }
 
-              this.#fragments.push(data)
+              this.writeFragments(data)
 
               if (!this.#info.fin) {
                 this.#state = parserStates.INFO
@@ -53877,11 +54460,10 @@ class ByteParser extends Writable {
                 return
               }
 
-              websocketMessageReceived(this.#handler, this.#info.binaryType, Buffer.concat(this.#fragments))
+              websocketMessageReceived(this.#handler, this.#info.binaryType, this.consumeFragments())
 
               this.#loop = true
               this.#state = parserStates.INFO
-              this.#fragments.length = 0
               this.run(callback)
             })
 
@@ -53905,34 +54487,70 @@ class ByteParser extends Writable {
       return emptyBuffer
     }
 
-    if (this.#buffers[0].length === n) {
-      this.#byteOffset -= this.#buffers[0].length
-      return this.#buffers.shift()
-    }
-
-    const buffer = Buffer.allocUnsafe(n)
-    let offset = 0
-
-    while (offset !== n) {
-      const next = this.#buffers[0]
-      const { length } = next
-
-      if (length + offset === n) {
-        buffer.set(this.#buffers.shift(), offset)
-        break
-      } else if (length + offset > n) {
-        buffer.set(next.subarray(0, n - offset), offset)
-        this.#buffers[0] = next.subarray(n - offset)
-        break
-      } else {
-        buffer.set(this.#buffers.shift(), offset)
-        offset += next.length
-      }
-    }
-
     this.#byteOffset -= n
 
-    return buffer
+    const first = this.#buffers[0]
+
+    if (first.length > n) {
+      // replace with remaining buffer
+      this.#buffers[0] = first.subarray(n, first.length)
+      return first.subarray(0, n)
+    } else if (first.length === n) {
+      // prefect match
+      return this.#buffers.shift()
+    } else {
+      let offset = 0
+      // If Buffer.allocUnsafe is used, extra copies will be made because the offset is non-zero.
+      const buffer = Buffer.allocUnsafeSlow(n)
+      while (offset !== n) {
+        const next = this.#buffers[0]
+        const length = next.length
+
+        if (length + offset === n) {
+          buffer.set(this.#buffers.shift(), offset)
+          break
+        } else if (length + offset > n) {
+          buffer.set(next.subarray(0, n - offset), offset)
+          this.#buffers[0] = next.subarray(n - offset)
+          break
+        } else {
+          buffer.set(this.#buffers.shift(), offset)
+          offset += length
+        }
+      }
+
+      return buffer
+    }
+  }
+
+  writeFragments (fragment) {
+    this.#fragmentsBytes += fragment.length
+    this.#fragments.push(fragment)
+  }
+
+  consumeFragments () {
+    const fragments = this.#fragments
+
+    if (fragments.length === 1) {
+      // single fragment
+      this.#fragmentsBytes = 0
+      return fragments.shift()
+    }
+
+    let offset = 0
+    // If Buffer.allocUnsafe is used, extra copies will be made because the offset is non-zero.
+    const output = Buffer.allocUnsafeSlow(this.#fragmentsBytes)
+
+    for (let i = 0; i < fragments.length; ++i) {
+      const buffer = fragments[i]
+      output.set(buffer, offset)
+      offset += buffer.length
+    }
+
+    this.#fragments = []
+    this.#fragmentsBytes = 0
+
+    return output
   }
 
   parseCloseBody (data) {
@@ -54279,8 +54897,8 @@ module.exports = { WebSocketError, createUnvalidatedWebSocketError }
 const { createDeferredPromise, environmentSettingsObject } = __nccwpck_require__(3168)
 const { states, opcodes, sentCloseFrameState } = __nccwpck_require__(736)
 const { webidl } = __nccwpck_require__(5893)
-const { getURLRecord, isValidSubprotocol, isEstablished, failWebsocketConnection, utf8Decode } = __nccwpck_require__(8625)
-const { establishWebSocketConnection, closeWebSocketConnection } = __nccwpck_require__(6897)
+const { getURLRecord, isValidSubprotocol, isEstablished, utf8Decode } = __nccwpck_require__(8625)
+const { establishWebSocketConnection, failWebsocketConnection, closeWebSocketConnection } = __nccwpck_require__(6897)
 const { types } = __nccwpck_require__(7975)
 const { channels } = __nccwpck_require__(2414)
 const { WebsocketFrameSend } = __nccwpck_require__(3264)
@@ -54856,7 +55474,7 @@ function toArrayBuffer (buffer) {
   if (buffer.byteLength === buffer.buffer.byteLength) {
     return buffer.buffer
   }
-  return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength)
+  return new Uint8Array(buffer).buffer
 }
 
 /**
@@ -54926,32 +55544,6 @@ function isValidStatusCode (code) {
 }
 
 /**
- * @param {import('./websocket').Handler} handler
- * @param {number} code
- * @param {string|undefined} reason
- * @returns {void}
- */
-function failWebsocketConnection (handler, code, reason) {
-  // If _The WebSocket Connection is Established_ prior to the point where
-  // the endpoint is required to _Fail the WebSocket Connection_, the
-  // endpoint SHOULD send a Close frame with an appropriate status code
-  // (Section 7.4) before proceeding to _Close the WebSocket Connection_.
-  if (isEstablished(handler.readyState)) {
-    // avoid circular require - performance is not important here
-    const { closeWebSocketConnection } = __nccwpck_require__(6897)
-    closeWebSocketConnection(handler, code, reason, false)
-  }
-
-  handler.controller.abort()
-
-  if (handler.socket?.destroyed === false) {
-    handler.socket.destroy()
-  }
-
-  handler.onFail(code, reason)
-}
-
-/**
  * @see https://datatracker.ietf.org/doc/html/rfc6455#section-5.5
  * @param {number} opcode
  * @returns {boolean}
@@ -55001,7 +55593,7 @@ function parseExtensions (extensions) {
 
   while (position.position < extensions.length) {
     const pair = collectASequenceOfCodePointsFast(';', extensions, position)
-    const [name, value = ''] = pair.split('=')
+    const [name, value = ''] = pair.split('=', 2)
 
     extensionList.set(
       removeHTTPWhitespace(name, true, false),
@@ -55119,7 +55711,6 @@ module.exports = {
   fireEvent,
   isValidSubprotocol,
   isValidStatusCode,
-  failWebsocketConnection,
   websocketMessageReceived,
   utf8Decode,
   isControlFrame,
@@ -55152,12 +55743,11 @@ const {
   isClosing,
   isValidSubprotocol,
   fireEvent,
-  failWebsocketConnection,
   utf8Decode,
   toArrayBuffer,
   getURLRecord
 } = __nccwpck_require__(8625)
-const { establishWebSocketConnection, closeWebSocketConnection } = __nccwpck_require__(6897)
+const { establishWebSocketConnection, closeWebSocketConnection, failWebsocketConnection } = __nccwpck_require__(6897)
 const { ByteParser } = __nccwpck_require__(1652)
 const { kEnumerableProperty } = __nccwpck_require__(3440)
 const { getGlobalDispatcher } = __nccwpck_require__(2581)
