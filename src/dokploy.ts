@@ -1,15 +1,21 @@
 import { fetch } from 'undici'
 
-export interface Project {
-  projectId: string
-  name: string
-  compose: Compose[]
-}
-
 export interface Compose {
   composeId: string
   name: string
   appName: string
+}
+
+export interface Environment {
+  environmentId: string
+  name: string
+  compose: Compose[]
+}
+
+export interface Project {
+  projectId: string
+  name: string
+  environments: Environment[]
 }
 
 export class Dokploy {
@@ -29,9 +35,21 @@ export class Dokploy {
       throw new Error(`Failed to fetch projects: ${await response.text()}`)
     }
 
-    const data = (await response.json()) as Project[]
+    return (await response.json()) as Project[]
+  }
 
-    return data
+  findCompose(projects: Project[], projectId: string, composeId: string): Compose {
+    const project = projects.find(p => p.projectId === projectId)
+    if (!project) {
+      throw new Error(`Project ${projectId} not found`)
+    }
+
+    for (const env of project.environments) {
+      const compose = env.compose?.find(c => c.composeId === composeId)
+      if (compose) return compose
+    }
+
+    throw new Error(`Compose ${composeId} not found in project ${project.name}`)
   }
 
   async redeployCompose(composeId: string): Promise<void> {

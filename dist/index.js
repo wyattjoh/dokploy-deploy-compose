@@ -62204,8 +62204,19 @@ class Dokploy {
         if (!response.ok) {
             throw new Error(`Failed to fetch projects: ${await response.text()}`);
         }
-        const data = (await response.json());
-        return data;
+        return (await response.json());
+    }
+    findCompose(projects, projectId, composeId) {
+        const project = projects.find(p => p.projectId === projectId);
+        if (!project) {
+            throw new Error(`Project ${projectId} not found`);
+        }
+        for (const env of project.environments) {
+            const compose = env.compose?.find(c => c.composeId === composeId);
+            if (compose)
+                return compose;
+        }
+        throw new Error(`Compose ${composeId} not found in project ${project.name}`);
     }
     async redeployCompose(composeId) {
         const response = await (0, undici_1.fetch)(`${this.url}/api/compose.redeploy`, {
@@ -62274,7 +62285,6 @@ const dokploy_1 = __nccwpck_require__(3325);
 async function run() {
     try {
         const url = core.getInput('url');
-        // Validate that the url is a valid URL
         try {
             new URL(url);
         }
@@ -62286,30 +62296,13 @@ async function run() {
         const projectId = core.getInput('project-id');
         const composeId = core.getInput('compose-id');
         core.info(`Deploying compose ${composeId} in project ${projectId}`);
-        let projects;
-        try {
-            projects = await dokploy.getProjects();
-        }
-        catch (error) {
-            throw new Error(`Failed to get projects: ${error}`);
-        }
-        const project = projects.find(p => p.projectId === projectId);
-        if (!project) {
-            throw new Error(`Project ${projectId} not found`);
-        }
-        const compose = project.compose.find(c => c.composeId === composeId);
-        if (!compose) {
-            throw new Error(`Compose ${composeId} not found`);
-        }
-        try {
-            await dokploy.redeployCompose(compose.composeId);
-        }
-        catch (error) {
-            throw new Error(`Failed to redeploy compose: ${error}`);
-        }
+        const projects = await dokploy.getProjects();
+        const compose = dokploy.findCompose(projects, projectId, composeId);
+        core.info(`Found compose: ${compose.name} (${compose.composeId})`);
+        await dokploy.redeployCompose(compose.composeId);
+        core.info(`Successfully triggered redeploy for ${compose.name}`);
     }
     catch (error) {
-        // Fail the workflow run if an error occurs
         if (error instanceof Error)
             core.setFailed(error.message);
     }
