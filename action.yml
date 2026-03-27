@@ -7,7 +7,7 @@ inputs:
     required: true
     default: 'https://panel.dokploy.com'
   token:
-    description: 'The Dokploy token'
+    description: 'The Dokploy API key (passed via x-api-key header)'
     required: true
   project-id:
     description: 'The project ID to deploy'

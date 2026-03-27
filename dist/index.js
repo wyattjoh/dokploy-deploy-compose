@@ -62197,7 +62197,7 @@ class Dokploy {
     async getProjects() {
         const response = await (0, undici_1.fetch)(`${this.url}/api/project.all`, {
             headers: {
-                Authorization: `Bearer ${this.token}`,
+                'x-api-key': this.token,
                 Accept: 'application/json'
             }
         });
@@ -62211,7 +62211,7 @@ class Dokploy {
         const response = await (0, undici_1.fetch)(`${this.url}/api/compose.redeploy`, {
             method: 'POST',
             headers: {
-                Authorization: `Bearer ${this.token}`,
+                'x-api-key': this.token,
                 Accept: 'application/json',
                 'Content-Type': 'application/json'
             },

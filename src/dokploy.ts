@@ -21,7 +21,7 @@ export class Dokploy {
   async getProjects(): Promise<Project[]> {
     const response = await fetch(`${this.url}/api/project.all`, {
       headers: {
-        Authorization: `Bearer ${this.token}`,
+        'x-api-key': this.token,
         Accept: 'application/json'
       }
     })
@@ -38,7 +38,7 @@ export class Dokploy {
     const response = await fetch(`${this.url}/api/compose.redeploy`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${this.token}`,
+        'x-api-key': this.token,
         Accept: 'application/json',
         'Content-Type': 'application/json'
       },
